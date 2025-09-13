@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Remote Classroom — Multi-Party (Low-BW prototype)</title>
+  <title>Remote Classroom — Low-BW Prototype</title>
   <style>
     :root{
       --bg:#0f1720; --panel:#0b1220; --card:#0f1728; --accent:#06b6d4; --muted:#9ca3af;
@@ -50,7 +50,7 @@
       <div id="status" style="color:var(--muted);margin-bottom:10px">Status: idle</div>
 
       <div id="videos">
-        <!-- local + remote tiles will be inserted here -->
+        <!-- local + remote tiles inserted here -->
       </div>
     </div>
   </main>
@@ -59,13 +59,17 @@
 
 <script>
 (() => {
-  // unchanged styling — only JS updated for correctness
-  const SIGNALING_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
-  const MAX_VIDEO_BITRATE = 400 * 1000;
+  // --- CONFIG --- (no styling changes)
+  const DEFAULT_ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' }
+    // TURN can be added dynamically if server provides credentials
+  ];
+  const MAX_VIDEO_BITRATE = 400 * 1000; // 400 kbps
   const clientId = Math.random().toString(36).slice(2,9);
 
-  // state
+  // --- STATE ---
   let ws = null;
+  let sendQueue = [];
   let roomId = null;
   let roomPass = null;
   let localStream = null;
@@ -73,8 +77,9 @@
   let monitorTimer = null;
   let lastTotalBytes = 0;
   let lastTotalTs = 0;
+  let iceServers = DEFAULT_ICE_SERVERS.slice();
 
-  // UI refs
+  // --- UI refs ---
   const roomInput = document.getElementById('roomId');
   const passInput = document.getElementById('roomPass');
   const createBtn = document.getElementById('createBtn');
@@ -88,29 +93,49 @@
 
   function setStatus(s){ statusEl.textContent = 'Status: ' + s; }
 
-  // WebSocket safe send
-  let sendQueue = [];
+  // --- util: ensure WS open and buffer sends ---
+  const SIGNALING_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
   function ensureWS(){
-    if (ws && ws.readyState === WebSocket.OPEN) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     ws = new WebSocket(SIGNALING_URL);
     ws.onopen = () => {
-      for (const m of sendQueue) ws.send(JSON.stringify(m));
-      sendQueue = [];
+      // flush queue
+      while(sendQueue.length) ws.send(JSON.stringify(sendQueue.shift()));
     };
-    ws.onmessage = (ev) => onSignalSafe(ev);
-    ws.onclose = () => { console.log('WS closed'); };
-    ws.onerror = (e) => console.error('WS err', e);
+    ws.onmessage = ev => handleSignalMessage(JSON.parse(ev.data));
+    ws.onclose = () => console.log('WS closed');
+    ws.onerror = e => console.error('WS error', e);
   }
   function safeSend(obj){
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       sendQueue.push(obj);
-      if (!ws || ws.readyState === WebSocket.CLOSED) ensureWS();
+      ensureWS();
     } else {
       ws.send(JSON.stringify(obj));
     }
   }
 
-  // local media
+  // --- try to fetch TURN credentials from server (optional) ---
+  async function fetchTurnServers(){
+    try {
+      const resp = await fetch('/turn');
+      if (!resp.ok) return;
+      const data = await resp.json(); // expected: { urls: ['turn:...'], username, credential }
+      const turnServers = [];
+      if (Array.isArray(data.urls)) {
+        turnServers.push({ urls: data.urls, username: data.username, credential: data.credential });
+      }
+      if (turnServers.length) {
+        iceServers = turnServers.concat(DEFAULT_ICE_SERVERS);
+        console.log('Using TURN servers from /turn');
+      }
+    } catch(e){
+      // ignore, we'll use STUN-only
+      console.log('No /turn endpoint or fetch failed, using STUN-only');
+    }
+  }
+
+  // --- local media ---
   async function startLocalMedia(){
     if (localStream) return;
     try {
@@ -139,27 +164,27 @@
     document.getElementById('video-local').srcObject = localStream;
   }
 
-  // create peer object
-  function createPeerObject(peerId){
+  // --- create peer object ---
+  function createPeerObject(peerId) {
     if (peers.has(peerId)) return peers.get(peerId);
+    const pc = new RTCPeerConnection({ iceServers });
 
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-    const pending = [];
-    const last = { lastBytes: 0, lastTs: 0 };
-
-    // attach local tracks if ready
+    // attach local tracks (if available)
     if (localStream) {
-      for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
     }
 
     // create remote tile
-    const tile = document.createElement('div'); tile.className='tile'; tile.id = 'tile-' + peerId;
+    const tile = document.createElement('div'); tile.className = 'tile'; tile.id = 'tile-' + peerId;
     const vid = document.createElement('video'); vid.id = 'video-' + peerId; vid.autoplay = true; vid.playsInline = true;
-    const lbl = document.createElement('div'); lbl.className='label'; lbl.innerText = 'Peer: ' + peerId;
+    const lbl = document.createElement('div'); lbl.className = 'label'; lbl.innerText = 'Peer: ' + peerId;
     tile.appendChild(vid); tile.appendChild(lbl);
     videosEl.appendChild(tile);
 
-    pc.ontrack = (e) => { vid.srcObject = e.streams[0]; };
+    const pendingCandidates = [];
+    const last = { lastBytes: 0, lastTs: 0 };
+
+    pc.ontrack = (ev) => { vid.srcObject = ev.streams[0]; };
 
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
@@ -168,27 +193,29 @@
     };
 
     pc.onconnectionstatechange = () => {
+      console.log('pc state for', peerId, pc.connectionState);
       if (['failed','closed','disconnected'].includes(pc.connectionState)) {
-        try{ pc.close(); }catch(e){}
+        try{ pc.close(); } catch(e){}
         const el = document.getElementById('tile-' + peerId); if (el) el.remove();
         peers.delete(peerId);
       }
     };
 
-    const obj = { pc, videoEl: vid, pendingCandidates: pending, last };
+    const obj = { pc, videoEl: vid, pendingCandidates, last };
     peers.set(peerId, obj);
     return obj;
   }
 
-  // deterministic offer rule: only peer with lexicographically greater ID initiates
-  async function startOfferIfNeeded(peerId){
+  // deterministic offer rule
+  async function maybeStartOffer(peerId) {
+    // lexicographic rule: higher clientId initiates
     if (clientId <= peerId) return;
     const obj = peers.get(peerId) || createPeerObject(peerId);
     const pc = obj.pc;
 
-    // set video bitrate param where supported
+    // apply encoder params to video sender(s) where supported
     try {
-      (pc.getSenders() || []).forEach(sender => {
+      pc.getSenders().forEach(sender => {
         if (sender.track && sender.track.kind === 'video') {
           const params = sender.getParameters();
           if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
@@ -196,33 +223,27 @@
           sender.setParameters(params).catch(()=>{});
         }
       });
-    } catch(e){}
+    } catch (e) {}
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     safeSend({ type:'signal', roomId, target: peerId, from: clientId, payload: { sdp: pc.localDescription } });
   }
 
-  // signaling handler (messages from server)
-  async function onSignalSafe(ev){
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
+  // --- signaling handler for incoming messages from server ---
+  async function handleSignalMessage(msg) {
     if (!msg) return;
-
-    // created/joined responses
+    if (msg.type === 'error') { alert(msg.message); return; }
     if (msg.type === 'created') { setStatus('Room created: ' + msg.roomId); leaveBtn.disabled = false; return; }
     if (msg.type === 'joined')  { setStatus('Joined room: ' + msg.roomId); leaveBtn.disabled = false; return; }
 
     if (msg.type === 'peer-joined') {
-      const other = msg.clientId;
-      if (other === clientId) return;
-      // ensure local media added first — if not started yet, wait
-      if (!localStream) {
-        // start media then create peer and maybe offer
-        await startLocalMedia();
-      }
-      createPeerObject(other);
-      startOfferIfNeeded(other);
+      const otherId = msg.clientId;
+      if (otherId === clientId) return;
+      // ensure local media started
+      if (!localStream) await startLocalMedia();
+      createPeerObject(otherId);
+      maybeStartOffer(otherId);
       return;
     }
 
@@ -236,10 +257,11 @@
       if (payload.sdp) {
         const sdpType = payload.sdp.type;
         if (sdpType === 'offer') {
+          // set remote offer, send answer
           await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-          // apply bitrate on senders if present
+          // ensure bitrate params applied on senders
           try {
-            (pc.getSenders() || []).forEach(sender => {
+            pc.getSenders().forEach(sender => {
               if (sender.track && sender.track.kind === 'video') {
                 const params = sender.getParameters();
                 if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
@@ -251,12 +273,13 @@
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           safeSend({ type:'signal', roomId, target: from, from: clientId, payload: { sdp: pc.localDescription } });
-          // drain queued ICE
+          // drain pending ICE
           while (obj.pendingCandidates.length) {
             const c = obj.pendingCandidates.shift();
             try { await pc.addIceCandidate(c); } catch(e){}
           }
         } else if (sdpType === 'answer') {
+          // only set answer if we have a local offer pending
           if (pc.signalingState === 'have-local-offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
             while (obj.pendingCandidates.length) {
@@ -264,11 +287,11 @@
               try { await pc.addIceCandidate(c); } catch(e){}
             }
           } else {
-            console.warn('Answer received but pc not in have-local-offer:', pc.signalingState);
+            console.warn('Received answer in state', pc.signalingState, ' — ignoring.');
           }
         }
       } else if (payload.candidate) {
-        // if remoteDescription set -> add, otherwise queue
+        // if remoteDesc present add, otherwise queue
         if (pc.remoteDescription && pc.remoteDescription.type) {
           try { await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch(e){}
         } else {
@@ -282,35 +305,38 @@
       const id = msg.clientId;
       if (peers.has(id)) {
         const obj = peers.get(id);
-        try{ obj.pc.close(); } catch(e){}
+        try { obj.pc.close(); } catch(e){}
         const el = document.getElementById('tile-' + id); if (el) el.remove();
         peers.delete(id);
       }
       return;
     }
-
-    if (msg.type === 'error') { alert(msg.message); return; }
   }
 
-  // UI actions
+  // --- UI actions ---
   createBtn.onclick = async () => {
     roomId = roomInput.value.trim(); roomPass = passInput.value.trim();
     if (!roomId || !roomPass) return alert('Enter room id + password');
-    // start local media first (so peers always get tracks)
-    await startLocalMedia();
-    ensureWS();
-    safeSend({ type:'create', roomId, password: roomPass, clientId });
-    setStatus('Creating room...');
-    // enable leave / toggles after join created by server events
+    // try to fetch TURN credentials (non-blocking)
+    fetchTurnServers().finally(async () => {
+      // start local media first
+      await startLocalMedia();
+      ensureWS();
+      // ensure ws open before sending; safeSend will buffer
+      safeSend({ type:'create', roomId, password: roomPass, clientId });
+      setStatus('Creating room...');
+    });
   };
 
   joinBtn.onclick = async () => {
     roomId = roomInput.value.trim(); roomPass = passInput.value.trim();
     if (!roomId || !roomPass) return alert('Enter room id + password');
-    await startLocalMedia();
-    ensureWS();
-    safeSend({ type:'join', roomId, password: roomPass, clientId });
-    setStatus('Joining room...');
+    fetchTurnServers().finally(async () => {
+      await startLocalMedia();
+      ensureWS();
+      safeSend({ type:'join', roomId, password: roomPass, clientId });
+      setStatus('Joining room...');
+    });
   };
 
   leaveBtn.onclick = () => {
@@ -335,14 +361,14 @@
     toggleVideoBtn.textContent = t.enabled ? 'Disable Video' : 'Enable Video';
   };
 
-  // start monitor (sum outbound bytes across all peers)
+  // --- start monitor (sum outbound bytes across peers) ---
   function startMonitor() {
     stopMonitor();
     lastTotalBytes = 0; lastTotalTs = 0;
     monitorTimer = setInterval(async () => {
       let totalBytes = 0;
       let latestTs = 0;
-      for (const [id, obj] of peers.entries()) {
+      for (const [id,obj] of peers.entries()) {
         try {
           const stats = await obj.pc.getStats();
           stats.forEach(r => {
@@ -357,9 +383,9 @@
       }
       const nowTs = latestTs || Date.now();
       if (lastTotalTs && nowTs && totalBytes >= lastTotalBytes) {
-        const ms = (nowTs - lastTotalTs) / 1000;
-        if (ms > 0) {
-          const kbps = ((totalBytes - lastTotalBytes) * 8) / (ms * 1000);
+        const seconds = (nowTs - lastTotalTs) / 1000;
+        if (seconds > 0) {
+          const kbps = ((totalBytes - lastTotalBytes) * 8) / (seconds * 1000);
           bitrateEl.textContent = 'Bitrate: ' + Math.round(kbps) + ' kbps';
         }
       }
@@ -367,12 +393,15 @@
       lastTotalTs = nowTs;
     }, 1000);
   }
-  function stopMonitor() { if (monitorTimer) { clearInterval(monitorTimer); monitorTimer = null; } bitrateEl.textContent = 'Bitrate: 0 kbps'; }
+  function stopMonitor(){ if (monitorTimer) { clearInterval(monitorTimer); monitorTimer = null; } bitrateEl.textContent = 'Bitrate: 0 kbps'; }
 
-  // cleanup
+  // start monitor automatically when peers present
+  setInterval(()=> { if (!monitorTimer && peers.size > 0) startMonitor(); }, 1000);
+
+  // --- cleanup ---
   function cleanup(){
     stopMonitor();
-    for (const [id, obj] of peers.entries()){
+    for (const [id,obj] of peers.entries()) {
       try{ obj.pc.close(); } catch(e){}
       const el = document.getElementById('tile-' + id); if (el) el.remove();
     }
@@ -388,16 +417,11 @@
     roomId = null; roomPass = null;
   }
 
-  // start monitor automatically if peers exist
-  setInterval(() => {
-    if (!monitorTimer && peers.size > 0) startMonitor();
-  }, 1000);
-
-  // ensure WS ready on load so create/join works instantly
+  // ensure WS ready on load
   ensureWS();
 
-  // expose some internals for debugging
-  window.__rc = { peers, clientId, safeSend, ensureWS, cleanup };
+  // expose for debugging
+  window.__rc = { peers, clientId, ensureWS, safeSend, cleanup };
 
 })();
 </script>
