@@ -59,10 +59,9 @@
 
 <script>
 (() => {
-  // --- CONFIG --- (no styling changes)
+  // --- CONFIG ---
   const DEFAULT_ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' }
-    // TURN can be added dynamically if server provides credentials
   ];
   const MAX_VIDEO_BITRATE = 400 * 1000; // 400 kbps
   const clientId = Math.random().toString(36).slice(2,9);
@@ -73,10 +72,11 @@
   let roomId = null;
   let roomPass = null;
   let localStream = null;
-  const peers = new Map(); // peerId -> { pc, videoEl, pendingCandidates:[], lastBytes, lastTs }
+  const peers = new Map(); // peerId -> { pc, videoEl, pendingCandidates:[], last }
   let monitorTimer = null;
-  let lastTotalBytes = 0;
-  let lastTotalTs = 0;
+  let lastOutboundBytes = 0;
+  let lastInboundBytes = 0;
+  let lastMonitorTs = 0;
   let iceServers = DEFAULT_ICE_SERVERS.slice();
 
   // --- UI refs ---
@@ -99,7 +99,6 @@
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     ws = new WebSocket(SIGNALING_URL);
     ws.onopen = () => {
-      // flush queue
       while(sendQueue.length) ws.send(JSON.stringify(sendQueue.shift()));
     };
     ws.onmessage = ev => handleSignalMessage(JSON.parse(ev.data));
@@ -115,12 +114,12 @@
     }
   }
 
-  // --- try to fetch TURN credentials from server (optional) ---
+  // --- try to fetch TURN servers from /turn (optional) ---
   async function fetchTurnServers(){
     try {
       const resp = await fetch('/turn');
       if (!resp.ok) return;
-      const data = await resp.json(); // expected: { urls: ['turn:...'], username, credential }
+      const data = await resp.json();
       const turnServers = [];
       if (Array.isArray(data.urls)) {
         turnServers.push({ urls: data.urls, username: data.username, credential: data.credential });
@@ -130,7 +129,6 @@
         console.log('Using TURN servers from /turn');
       }
     } catch(e){
-      // ignore, we'll use STUN-only
       console.log('No /turn endpoint or fetch failed, using STUN-only');
     }
   }
@@ -208,12 +206,10 @@
 
   // deterministic offer rule
   async function maybeStartOffer(peerId) {
-    // lexicographic rule: higher clientId initiates
     if (clientId <= peerId) return;
     const obj = peers.get(peerId) || createPeerObject(peerId);
     const pc = obj.pc;
 
-    // apply encoder params to video sender(s) where supported
     try {
       pc.getSenders().forEach(sender => {
         if (sender.track && sender.track.kind === 'video') {
@@ -230,7 +226,7 @@
     safeSend({ type:'signal', roomId, target: peerId, from: clientId, payload: { sdp: pc.localDescription } });
   }
 
-  // --- signaling handler for incoming messages from server ---
+  // --- signaling handler ---
   async function handleSignalMessage(msg) {
     if (!msg) return;
     if (msg.type === 'error') { alert(msg.message); return; }
@@ -240,7 +236,6 @@
     if (msg.type === 'peer-joined') {
       const otherId = msg.clientId;
       if (otherId === clientId) return;
-      // ensure local media started
       if (!localStream) await startLocalMedia();
       createPeerObject(otherId);
       maybeStartOffer(otherId);
@@ -257,9 +252,7 @@
       if (payload.sdp) {
         const sdpType = payload.sdp.type;
         if (sdpType === 'offer') {
-          // set remote offer, send answer
           await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-          // ensure bitrate params applied on senders
           try {
             pc.getSenders().forEach(sender => {
               if (sender.track && sender.track.kind === 'video') {
@@ -273,13 +266,11 @@
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           safeSend({ type:'signal', roomId, target: from, from: clientId, payload: { sdp: pc.localDescription } });
-          // drain pending ICE
           while (obj.pendingCandidates.length) {
             const c = obj.pendingCandidates.shift();
             try { await pc.addIceCandidate(c); } catch(e){}
           }
         } else if (sdpType === 'answer') {
-          // only set answer if we have a local offer pending
           if (pc.signalingState === 'have-local-offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
             while (obj.pendingCandidates.length) {
@@ -291,7 +282,6 @@
           }
         }
       } else if (payload.candidate) {
-        // if remoteDesc present add, otherwise queue
         if (pc.remoteDescription && pc.remoteDescription.type) {
           try { await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch(e){}
         } else {
@@ -317,12 +307,9 @@
   createBtn.onclick = async () => {
     roomId = roomInput.value.trim(); roomPass = passInput.value.trim();
     if (!roomId || !roomPass) return alert('Enter room id + password');
-    // try to fetch TURN credentials (non-blocking)
     fetchTurnServers().finally(async () => {
-      // start local media first
       await startLocalMedia();
       ensureWS();
-      // ensure ws open before sending; safeSend will buffer
       safeSend({ type:'create', roomId, password: roomPass, clientId });
       setStatus('Creating room...');
     });
@@ -361,36 +348,49 @@
     toggleVideoBtn.textContent = t.enabled ? 'Disable Video' : 'Enable Video';
   };
 
-  // --- start monitor (sum outbound bytes across peers) ---
+  // --- monitor (upload + download) ---
   function startMonitor() {
     stopMonitor();
-    lastTotalBytes = 0; lastTotalTs = 0;
+    lastOutboundBytes = 0; lastInboundBytes = 0; lastMonitorTs = 0;
     monitorTimer = setInterval(async () => {
-      let totalBytes = 0;
+      let totalOutbound = 0;
+      let totalInbound = 0;
       let latestTs = 0;
-      for (const [id,obj] of peers.entries()) {
+
+      for (const [id, obj] of peers.entries()) {
         try {
           const stats = await obj.pc.getStats();
           stats.forEach(r => {
+            // outbound
             if (r.type === 'outbound-rtp' && (r.kind === 'video' || r.mediaType === 'video' || r.isRemote === false)) {
-              if (r.bytesSent) {
-                totalBytes += r.bytesSent;
-                if (r.timestamp && r.timestamp > latestTs) latestTs = r.timestamp;
-              }
+              if (r.bytesSent) totalOutbound += r.bytesSent;
+              if (r.timestamp && r.timestamp > latestTs) latestTs = r.timestamp;
+            }
+            // inbound
+            if (r.type === 'inbound-rtp' && (r.kind === 'video' || r.mediaType === 'video' || r.isRemote === false)) {
+              if (r.bytesReceived) totalInbound += r.bytesReceived;
+              if (r.timestamp && r.timestamp > latestTs) latestTs = r.timestamp;
             }
           });
         } catch(e){}
       }
+
       const nowTs = latestTs || Date.now();
-      if (lastTotalTs && nowTs && totalBytes >= lastTotalBytes) {
-        const seconds = (nowTs - lastTotalTs) / 1000;
+      if (lastMonitorTs && nowTs && totalOutbound >= lastOutboundBytes && totalInbound >= lastInboundBytes) {
+        const seconds = (nowTs - lastMonitorTs) / 1000;
         if (seconds > 0) {
-          const kbps = ((totalBytes - lastTotalBytes) * 8) / (seconds * 1000);
-          bitrateEl.textContent = 'Bitrate: ' + Math.round(kbps) + ' kbps';
+          const uploadKbps = ((totalOutbound - lastOutboundBytes) * 8) / (seconds * 1000);
+          const downloadKbps = ((totalInbound - lastInboundBytes) * 8) / (seconds * 1000);
+          bitrateEl.textContent = 'Upload: ' + Math.round(uploadKbps) + ' kbps | Download: ' + Math.round(downloadKbps) + ' kbps';
         }
+      } else {
+        // initial or fallback
+        bitrateEl.textContent = 'Upload: 0 kbps | Download: 0 kbps';
       }
-      lastTotalBytes = totalBytes;
-      lastTotalTs = nowTs;
+
+      lastOutboundBytes = totalOutbound;
+      lastInboundBytes = totalInbound;
+      lastMonitorTs = nowTs;
     }, 1000);
   }
   function stopMonitor(){ if (monitorTimer) { clearInterval(monitorTimer); monitorTimer = null; } bitrateEl.textContent = 'Bitrate: 0 kbps'; }
