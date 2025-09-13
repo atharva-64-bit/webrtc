@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Remote Classroom — Multi-Party (Low-BW prototype)</title>
+  <style>
+    :root{
+      --bg:#0f1720; --panel:#0b1220; --card:#0f1728; --accent:#06b6d4; --muted:#9ca3af;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:Inter, system-ui, Arial, sans-serif; background:var(--bg); color:#e6eef6;
+      -webkit-font-smoothing:antialiased;
+    }
+    header{background:linear-gradient(90deg,#071022,#0b1220); padding:14px 18px; text-align:center; font-weight:700}
+    .app{max-width:1100px;margin:18px auto;padding:12px}
+    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:12px; padding:14px}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    input{padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
+    button{padding:10px 12px;border-radius:8px;border:0;background:var(--accent);color:#022;cursor:pointer;font-weight:600}
+    button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--muted)}
+    button.warn{background:#ef4444;color:#fff}
+    #videos{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:14px}
+    .tile{background:#000;border-radius:10px;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative}
+    .tile video{width:100%;height:100%;object-fit:cover;display:block}
+    .label{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,0.6);padding:6px 8px;border-radius:6px;font-size:13px;color:#fff}
+    #bitrate{position:fixed;right:14px;bottom:14px;background:rgba(0,0,0,0.6);padding:8px 10px;border-radius:8px;font-family:monospace}
+    @media (max-width:640px){ .row{flex-direction:column;align-items:stretch} }
+  </style>
+</head>
+<body>
+  <header>🎓 Remote Classroom — Low-BW Prototype</header>
+
+  <main class="app">
+    <div class="card">
+      <div class="row" style="align-items:center;margin-bottom:12px">
+        <input id="roomId" placeholder="Room ID (alphanumeric)" />
+        <input id="roomPass" type="password" placeholder="Room password" />
+        <button id="createBtn">Create Room</button>
+        <button id="joinBtn">Join Room</button>
+        <button id="leaveBtn" class="warn" disabled>Leave Room</button>
+
+        <div style="flex:1"></div>
+
+        <button id="toggleAudioBtn" class="ghost" disabled>Mute Audio</button>
+        <button id="toggleVideoBtn" class="ghost" disabled>Disable Video</button>
+      </div>
+
+      <div id="status" style="color:var(--muted);margin-bottom:10px">Status: idle</div>
+
+      <div id="videos">
+        <!-- local + remote tiles will be inserted here -->
+      </div>
+    </div>
+  </main>
+
+  <div id="bitrate">Bitrate: 0 kbps</div>
+
+<script>
+(() => {
+  // unchanged styling — only JS updated for correctness
+  const SIGNALING_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  const MAX_VIDEO_BITRATE = 400 * 1000;
+  const clientId = Math.random().toString(36).slice(2,9);
+
+  // state
+  let ws = null;
+  let roomId = null;
+  let roomPass = null;
+  let localStream = null;
+  const peers = new Map(); // peerId -> { pc, videoEl, pendingCandidates:[], lastBytes, lastTs }
+  let monitorTimer = null;
+  let lastTotalBytes = 0;
+  let lastTotalTs = 0;
+
+  // UI refs
+  const roomInput = document.getElementById('roomId');
+  const passInput = document.getElementById('roomPass');
+  const createBtn = document.getElementById('createBtn');
+  const joinBtn = document.getElementById('joinBtn');
+  const leaveBtn = document.getElementById('leaveBtn');
+  const toggleAudioBtn = document.getElementById('toggleAudioBtn');
+  const toggleVideoBtn = document.getElementById('toggleVideoBtn');
+  const statusEl = document.getElementById('status');
+  const videosEl = document.getElementById('videos');
+  const bitrateEl = document.getElementById('bitrate');
+
+  function setStatus(s){ statusEl.textContent = 'Status: ' + s; }
+
+  // WebSocket safe send
+  let sendQueue = [];
+  function ensureWS(){
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+    ws = new WebSocket(SIGNALING_URL);
+    ws.onopen = () => {
+      for (const m of sendQueue) ws.send(JSON.stringify(m));
+      sendQueue = [];
+    };
+    ws.onmessage = (ev) => onSignalSafe(ev);
+    ws.onclose = () => { console.log('WS closed'); };
+    ws.onerror = (e) => console.error('WS err', e);
+  }
+  function safeSend(obj){
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      sendQueue.push(obj);
+      if (!ws || ws.readyState === WebSocket.CLOSED) ensureWS();
+    } else {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  // local media
+  async function startLocalMedia(){
+    if (localStream) return;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation:true, noiseSuppression:true },
+        video: { width:640, height:360, frameRate:15 }
+      });
+      createOrUpdateLocalTile();
+      toggleAudioBtn.disabled = false;
+      toggleVideoBtn.disabled = false;
+    } catch(e){
+      alert('Camera/mic error: ' + (e.message || e));
+      throw e;
+    }
+  }
+
+  function createOrUpdateLocalTile(){
+    let tile = document.getElementById('tile-local');
+    if (!tile) {
+      tile = document.createElement('div'); tile.className = 'tile'; tile.id = 'tile-local';
+      const v = document.createElement('video'); v.id = 'video-local'; v.autoplay = true; v.muted = true; v.playsInline = true;
+      const lbl = document.createElement('div'); lbl.className = 'label'; lbl.innerText = 'You';
+      tile.appendChild(v); tile.appendChild(lbl);
+      videosEl.prepend(tile);
+    }
+    document.getElementById('video-local').srcObject = localStream;
+  }
+
+  // create peer object
+  function createPeerObject(peerId){
+    if (peers.has(peerId)) return peers.get(peerId);
+
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const pending = [];
+    const last = { lastBytes: 0, lastTs: 0 };
+
+    // attach local tracks if ready
+    if (localStream) {
+      for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+    }
+
+    // create remote tile
+    const tile = document.createElement('div'); tile.className='tile'; tile.id = 'tile-' + peerId;
+    const vid = document.createElement('video'); vid.id = 'video-' + peerId; vid.autoplay = true; vid.playsInline = true;
+    const lbl = document.createElement('div'); lbl.className='label'; lbl.innerText = 'Peer: ' + peerId;
+    tile.appendChild(vid); tile.appendChild(lbl);
+    videosEl.appendChild(tile);
+
+    pc.ontrack = (e) => { vid.srcObject = e.streams[0]; };
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        safeSend({ type:'signal', roomId, target: peerId, from: clientId, payload: { candidate: ev.candidate } });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (['failed','closed','disconnected'].includes(pc.connectionState)) {
+        try{ pc.close(); }catch(e){}
+        const el = document.getElementById('tile-' + peerId); if (el) el.remove();
+        peers.delete(peerId);
+      }
+    };
+
+    const obj = { pc, videoEl: vid, pendingCandidates: pending, last };
+    peers.set(peerId, obj);
+    return obj;
+  }
+
+  // deterministic offer rule: only peer with lexicographically greater ID initiates
+  async function startOfferIfNeeded(peerId){
+    if (clientId <= peerId) return;
+    const obj = peers.get(peerId) || createPeerObject(peerId);
+    const pc = obj.pc;
+
+    // set video bitrate param where supported
+    try {
+      (pc.getSenders() || []).forEach(sender => {
+        if (sender.track && sender.track.kind === 'video') {
+          const params = sender.getParameters();
+          if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+          params.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
+          sender.setParameters(params).catch(()=>{});
+        }
+      });
+    } catch(e){}
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    safeSend({ type:'signal', roomId, target: peerId, from: clientId, payload: { sdp: pc.localDescription } });
+  }
+
+  // signaling handler (messages from server)
+  async function onSignalSafe(ev){
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (!msg) return;
+
+    // created/joined responses
+    if (msg.type === 'created') { setStatus('Room created: ' + msg.roomId); leaveBtn.disabled = false; return; }
+    if (msg.type === 'joined')  { setStatus('Joined room: ' + msg.roomId); leaveBtn.disabled = false; return; }
+
+    if (msg.type === 'peer-joined') {
+      const other = msg.clientId;
+      if (other === clientId) return;
+      // ensure local media added first — if not started yet, wait
+      if (!localStream) {
+        // start media then create peer and maybe offer
+        await startLocalMedia();
+      }
+      createPeerObject(other);
+      startOfferIfNeeded(other);
+      return;
+    }
+
+    if (msg.type === 'signal') {
+      const from = msg.from;
+      if (!from || from === clientId) return;
+      const payload = msg.payload;
+      const obj = peers.get(from) || createPeerObject(from);
+      const pc = obj.pc;
+
+      if (payload.sdp) {
+        const sdpType = payload.sdp.type;
+        if (sdpType === 'offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          // apply bitrate on senders if present
+          try {
+            (pc.getSenders() || []).forEach(sender => {
+              if (sender.track && sender.track.kind === 'video') {
+                const params = sender.getParameters();
+                if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+                params.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
+                sender.setParameters(params).catch(()=>{});
+              }
+            });
+          } catch(e){}
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          safeSend({ type:'signal', roomId, target: from, from: clientId, payload: { sdp: pc.localDescription } });
+          // drain queued ICE
+          while (obj.pendingCandidates.length) {
+            const c = obj.pendingCandidates.shift();
+            try { await pc.addIceCandidate(c); } catch(e){}
+          }
+        } else if (sdpType === 'answer') {
+          if (pc.signalingState === 'have-local-offer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            while (obj.pendingCandidates.length) {
+              const c = obj.pendingCandidates.shift();
+              try { await pc.addIceCandidate(c); } catch(e){}
+            }
+          } else {
+            console.warn('Answer received but pc not in have-local-offer:', pc.signalingState);
+          }
+        }
+      } else if (payload.candidate) {
+        // if remoteDescription set -> add, otherwise queue
+        if (pc.remoteDescription && pc.remoteDescription.type) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch(e){}
+        } else {
+          obj.pendingCandidates.push(new RTCIceCandidate(payload.candidate));
+        }
+      }
+      return;
+    }
+
+    if (msg.type === 'peer-left') {
+      const id = msg.clientId;
+      if (peers.has(id)) {
+        const obj = peers.get(id);
+        try{ obj.pc.close(); } catch(e){}
+        const el = document.getElementById('tile-' + id); if (el) el.remove();
+        peers.delete(id);
+      }
+      return;
+    }
+
+    if (msg.type === 'error') { alert(msg.message); return; }
+  }
+
+  // UI actions
+  createBtn.onclick = async () => {
+    roomId = roomInput.value.trim(); roomPass = passInput.value.trim();
+    if (!roomId || !roomPass) return alert('Enter room id + password');
+    // start local media first (so peers always get tracks)
+    await startLocalMedia();
+    ensureWS();
+    safeSend({ type:'create', roomId, password: roomPass, clientId });
+    setStatus('Creating room...');
+    // enable leave / toggles after join created by server events
+  };
+
+  joinBtn.onclick = async () => {
+    roomId = roomInput.value.trim(); roomPass = passInput.value.trim();
+    if (!roomId || !roomPass) return alert('Enter room id + password');
+    await startLocalMedia();
+    ensureWS();
+    safeSend({ type:'join', roomId, password: roomPass, clientId });
+    setStatus('Joining room...');
+  };
+
+  leaveBtn.onclick = () => {
+    if (!roomId) return;
+    safeSend({ type:'leave', roomId, clientId });
+    cleanup();
+    setStatus('Left');
+  };
+
+  toggleAudioBtn.onclick = () => {
+    if (!localStream) return;
+    const t = localStream.getAudioTracks()[0];
+    if (!t) return;
+    t.enabled = !t.enabled;
+    toggleAudioBtn.textContent = t.enabled ? 'Mute Audio' : 'Unmute Audio';
+  };
+  toggleVideoBtn.onclick = () => {
+    if (!localStream) return;
+    const t = localStream.getVideoTracks()[0];
+    if (!t) return;
+    t.enabled = !t.enabled;
+    toggleVideoBtn.textContent = t.enabled ? 'Disable Video' : 'Enable Video';
+  };
+
+  // start monitor (sum outbound bytes across all peers)
+  function startMonitor() {
+    stopMonitor();
+    lastTotalBytes = 0; lastTotalTs = 0;
+    monitorTimer = setInterval(async () => {
+      let totalBytes = 0;
+      let latestTs = 0;
+      for (const [id, obj] of peers.entries()) {
+        try {
+          const stats = await obj.pc.getStats();
+          stats.forEach(r => {
+            if (r.type === 'outbound-rtp' && (r.kind === 'video' || r.mediaType === 'video' || r.isRemote === false)) {
+              if (r.bytesSent) {
+                totalBytes += r.bytesSent;
+                if (r.timestamp && r.timestamp > latestTs) latestTs = r.timestamp;
+              }
+            }
+          });
+        } catch(e){}
+      }
+      const nowTs = latestTs || Date.now();
+      if (lastTotalTs && nowTs && totalBytes >= lastTotalBytes) {
+        const ms = (nowTs - lastTotalTs) / 1000;
+        if (ms > 0) {
+          const kbps = ((totalBytes - lastTotalBytes) * 8) / (ms * 1000);
+          bitrateEl.textContent = 'Bitrate: ' + Math.round(kbps) + ' kbps';
+        }
+      }
+      lastTotalBytes = totalBytes;
+      lastTotalTs = nowTs;
+    }, 1000);
+  }
+  function stopMonitor() { if (monitorTimer) { clearInterval(monitorTimer); monitorTimer = null; } bitrateEl.textContent = 'Bitrate: 0 kbps'; }
+
+  // cleanup
+  function cleanup(){
+    stopMonitor();
+    for (const [id, obj] of peers.entries()){
+      try{ obj.pc.close(); } catch(e){}
+      const el = document.getElementById('tile-' + id); if (el) el.remove();
+    }
+    peers.clear();
+    if (localStream) {
+      for (const t of localStream.getTracks()) try{ t.stop(); } catch(e){}
+      localStream = null;
+      const localTile = document.getElementById('tile-local'); if (localTile) localTile.remove();
+    }
+    leaveBtn.disabled = true;
+    toggleAudioBtn.disabled = true;
+    toggleVideoBtn.disabled = true;
+    roomId = null; roomPass = null;
+  }
+
+  // start monitor automatically if peers exist
+  setInterval(() => {
+    if (!monitorTimer && peers.size > 0) startMonitor();
+  }, 1000);
+
+  // ensure WS ready on load so create/join works instantly
+  ensureWS();
+
+  // expose some internals for debugging
+  window.__rc = { peers, clientId, safeSend, ensureWS, cleanup };
+
+})();
+</script>
+</body>
+</html>
